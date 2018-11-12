@@ -58,7 +58,7 @@ class KernelResourceSpec:
     mounts: Sequence[str] = attr.Factory(list)
     scratch_disk_size: int = None
 
-    reserved_share_types = frozenset(['_cpu', '_mem', '_gpu'])
+    reserved_share_types = frozenset(['_cpu', '_mem', '_gpu', '_tpu'])
 
     def write_to_file(self, file: io.TextIOBase):
         '''
@@ -290,6 +290,7 @@ async def detect_slots(etcd, limit_cpus=None, limit_gpus=None):
         'mem': mem_bytes >> 20,  # MiB
         'cpu': num_cores,        # core count
         'gpu': '0.0',
+        'tpu': '0.0',
     }
     entry_prefix = 'backendai_accelerator_v10'
     for entrypoint in pkg_resources.iter_entry_points(entry_prefix):
