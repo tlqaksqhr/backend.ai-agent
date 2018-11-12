@@ -93,7 +93,7 @@ async def kernel_info(agent, docker):
     kernel_id = str(uuid.uuid4())
     config = {
         'lang': 'lua:5.3-alpine',
-        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1},
+        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1, 'tpu_slot': 0},
         'mounts': [],
         'environ': {},
     }
@@ -145,7 +145,7 @@ async def test_create_kernel(agent, docker):
     kernel_id = str(uuid.uuid4())
     config = {
         'lang': 'lablup/lua:5.3-alpine',
-        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1},
+        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1, 'tpu_slot': 0},
         'mounts': [],
         'environ': {},
     }
@@ -194,7 +194,7 @@ async def test_restart_kernel(agent, kernel_info):
     container_id = kernel_info['container_id']
     new_config = {
         'lang': 'lablup/lua:5.3-alpine',
-        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1},
+        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1, 'tpu_slot': 0},
         'mounts': [],
     }
 
@@ -237,7 +237,7 @@ async def test_restart_kernel_cancel_code_execution(
         kernel_id = kernel_info['id']
         new_config = {
             'lang': 'lablup/lua:5.3-alpine',
-            'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1},
+            'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1, 'tpu_slot': 0},
             'mounts': [],
         }
         await agent.restart_kernel(kernel_id, new_config)
@@ -334,7 +334,7 @@ async def test_reset(agent, docker):
     container_ids = []
     config = {
         'lang': 'lablup/lua:5.3-alpine',
-        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1},
+        'limits': {'cpu_slot': 1, 'gpu_slot': 0, 'mem_slot': 1, 'tpu_slot': 0},
         'mounts': [],
     }
 
