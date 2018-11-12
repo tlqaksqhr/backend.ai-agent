@@ -733,6 +733,11 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 _, cuda_allocated_shares = \
                     accl.alloc_map.alloc(limits['gpu_slot'])
                 resource_spec.shares['cuda'] = cuda_allocated_shares
+            if limits['tpu_slot'] > 0:
+                accl = self.accelerators['tpu']
+                _, tpu_allocated_shares = \
+                    accl.alloc_map.alloc(limits['tpu_slot'])
+                resource_spec.shares['tpu'] = tpu_allocated_shares
 
             # Realize vfolder mounts.
             for folder_name, folder_host, folder_id in vfolders:
