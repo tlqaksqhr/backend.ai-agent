@@ -779,6 +779,9 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
             with open(config_dir / 'environ.txt', 'w') as f:
                 for k, v in environ.items():
                     f.write(f'{k}={v}\n')
+                accel_envs = accel_docker_args.get('Env')
+                for env in accel_envs:
+                    f.write(f'{env}\n')
             with open(config_dir / 'resource.txt', 'w') as f:
                 resource_spec.write_to_file(f)
 
