@@ -8,9 +8,9 @@ from pathlib import Path
 from pprint import pformat
 import re
 import shlex
+import signal
 import shutil
 import subprocess
-import sys
 import time
 from typing import Collection, Mapping
 
@@ -23,33 +23,29 @@ import aiozmq, aiozmq.rpc
 from async_timeout import timeout
 import attr
 import configargparse
+from setproctitle import setproctitle
 import snappy
 import trafaret as t
 import uvloop
 import zmq
 import zmq.asyncio
-try:
-    import datadog
-    datadog_available = True
-except ImportError:
-    datadog_available = False
-try:
-    import raven
-    raven_available = True
-except ImportError:
-    raven_available = False
 
 from ai.backend.common import utils, identity, msgpack
 from ai.backend.common.argparse import (
-    port_no, HostPortPair,
+    port_no, port_range, HostPortPair,
     host_port_pair, non_negative_int)
 from ai.backend.common.etcd import AsyncEtcd
 from ai.backend.common.logging import Logger, BraceStyleAdapter
-from ai.backend.common.monitor import DummyStatsd, DummySentry
+from ai.backend.common.monitor import DummyStatsMonitor, DummyErrorMonitor
+from ai.backend.common.plugin import install_plugins, add_plugin_args
+from ai.backend.common.types import ImageRef
 from . import __version__ as VERSION
 from .files import scandir, upload_output_files_to_s3
 from .accelerator import accelerator_types, AbstractAccelerator
-from .stats import spawn_stat_collector, StatCollectorState
+from .stats import (
+    get_preferred_stat_type, collect_agent_live_stats,
+    spawn_stat_collector, StatCollectorState,
+)
 from .resources import (
     KernelResourceSpec,
     Mount, MountPermission,
@@ -152,6 +148,41 @@ def get_label(labels: Mapping[str, str], name, default):
     return v
 
 
+def parse_service_port(s: str) -> dict:
+    try:
+        name, protocol, port = s.split(':')
+    except (ValueError, IndexError):
+        raise ValueError('Invalid service port definition format', s)
+    assert protocol in ('tcp', 'pty', 'http'), \
+           f'Unsupported service port protocol: {protocol}'
+    try:
+        port = int(port)
+    except ValueError:
+        raise ValueError('Invalid port number', port)
+    if port <= 1024:
+        raise ValueError('Service port number must be larger than 1024.')
+    if port in (2000, 2001):
+        raise ValueError('Service port 2000 and 2001 is reserved for internal use.')
+    return {
+        'name': name,
+        'protocol': protocol,
+        'container_port': port,
+        'host_port': None,  # determined after container start
+    }
+
+
+def update_last_used(meth):
+    @functools.wraps(meth)
+    async def _inner(self, kernel_id: str, *args, **kwargs):
+        try:
+            kernel_info = self.container_registry[kernel_id]
+            kernel_info['last_used'] = time.monotonic()
+        except KeyError:
+            pass
+        return await meth(self, kernel_id, *args, **kwargs)
+    return _inner
+
+
 class AgentRPCServer(aiozmq.rpc.AttrHandler):
 
     __slots__ = (
@@ -162,13 +193,14 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         'rpc_server', 'event_sock',
         'monitor_fetch_task', 'monitor_handle_task', 'stat_collector_task',
         'hb_timer', 'clean_timer',
-        'statsd', 'sentry',
+        'stats_monitor', 'error_monitor',
         'restarting_kernels', 'blocking_cleans',
     )
 
     def __init__(self, config, loop=None):
         self.loop = loop if loop else asyncio.get_event_loop()
         self.config = config
+        self.config.app_name = 'backend.ai-agent'
         self.etcd = None
 
         self.docker = Docker()
@@ -191,14 +223,21 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         self.clean_timer = None
         self.stat_collector_task = None
 
-        self.statsd = DummyStatsd()
-        self.sentry = DummySentry()
-        if datadog_available and self.config.datadog_api_key:
-            self.statsd = datadog.statsd
-        if raven_available and self.config.raven_uri:
-            self.sentry = raven.Client(
-                self.config.raven_uri,
-                release=raven.fetch_package_version('backend.ai-agent'))
+        self.port_pool = set(range(
+            config.container_port_range[0],
+            config.container_port_range[1] + 1,
+        ))
+
+        self.stats_monitor = DummyStatsMonitor()
+        self.error_monitor = DummyErrorMonitor()
+
+        self.runner_lock = asyncio.Lock()
+
+        plugins = [
+            'stats_monitor',
+            'error_monitor'
+        ]
+        install_plugins(plugins, self, 'attr', self.config)
 
     async def detect_manager(self):
         log.info('detecting the manager...')
@@ -254,7 +293,11 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 port_map = {}
                 for private_port, host_ports in ports.items():
                     private_port = int(private_port.split('/')[0])
-                    public_port = int(host_ports[0]['HostPort'])
+                    if host_ports is None:
+                        public_port = 0
+                    else:
+                        public_port = int(host_ports[0]['HostPort'])
+                        self.port_pool.discard(public_port)
                     port_map[private_port] = public_port
                 cpu_set = set(
                     map(int, (container['HostConfig']['CpusetCpus']).split(',')))
@@ -264,22 +307,32 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 else:
                     kernel_host = '127.0.0.1'
                 config_dir = (self.config.scratch_root /
-                              kernel_id / '.config').resolve()
+                              kernel_id / 'config').resolve()
                 with open(config_dir / 'resource.txt', 'r') as f:
                     resource_spec = KernelResourceSpec.read_from_file(f)
+                service_ports = []
+                for item in get_label(labels, 'service-ports', '').split(','):
+                    if not item:
+                        continue
+                    service_port = parse_service_port(item)
+                    service_port['host_port'] = \
+                        port_map.get(service_port['container_port'], None)
+                    service_ports.append(service_port)
                 self.container_registry[kernel_id] = {
-                    'lang': image[14:],  # len('lablup/kernel-')
+                    'lang': ImageRef(image),
                     'version': int(get_label(labels, 'version', '1')),
                     'container_id': container._id,
                     'kernel_host': kernel_host,
                     'repl_in_port': port_map[2000],
                     'repl_out_port': port_map[2001],
-                    'stdin_port': port_map[2002],
-                    'stdout_port': port_map[2003],
+                    'stdin_port': port_map.get(2002, 0),
+                    'stdout_port': port_map.get(2003, 0),
                     'exec_timeout': int(get_label(labels, 'timeout', '10')),
                     'last_used': time.monotonic(),
                     'runner_tasks': set(),
+                    'host_ports': [*port_map.values()],
                     'resource_spec': resource_spec,
+                    'service_ports': service_ports,
                 }
             elif status in {'exited', 'dead', 'removing'}:
                 log.info('detected terminated kernel: {0}', kernel_id)
@@ -341,7 +394,9 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         context = zmq.asyncio.Context()
         stats_sock = context.socket(zmq.PULL)
         stats_sock.setsockopt(zmq.LINGER, 1000)
-        stats_sock.bind(f'tcp://{self.config.agent_host}:{self.config.stat_port}')
+        stats_sock.bind(f'tcp://127.0.0.1:{self.config.stat_port}')
+        log.info('collecting stats at port tcp://127.0.0.1:{0}',
+                 self.config.stat_port)
         try:
             recv = functools.partial(stats_sock.recv_serialized,
                                      lambda vs: [msgpack.unpackb(v) for v in vs])
@@ -413,6 +468,15 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         self.stats = dict()
         self.stat_collector_task = self.loop.create_task(self.collect_stats())
 
+        # Start container stats collector for existing containers.
+        stat_addr = f'tcp://{self.config.agent_host}:{self.config.stat_port}'
+        stat_type = get_preferred_stat_type()
+        for kernel_id, info in self.container_registry.items():
+            cid = info['container_id']
+            self.stats[cid] = StatCollectorState(kernel_id)
+            async with spawn_stat_collector(stat_addr, stat_type, cid):
+                pass
+
         # Spawn docker monitoring tasks.
         self.monitor_fetch_task  = self.loop.create_task(self.fetch_docker_events())
         self.monitor_handle_task = self.loop.create_task(self.monitor())
@@ -437,7 +501,7 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         # Notify the gateway.
         await self.send_event('instance_started')
 
-    async def shutdown(self):
+    async def shutdown(self, stop_signal):
         await self.deregister_myself()
 
         # Stop receiving further requests.
@@ -448,6 +512,9 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         # Close all pending kernel runners.
         for kernel_id in self.container_registry.keys():
             await self.clean_runner(kernel_id)
+
+        if stop_signal == signal.SIGTERM:
+            await self.clean_all_kernels(blocking=True)
 
         # Stop timers.
         if self.scan_images_timer is not None:
@@ -495,7 +562,7 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
             raise
         except Exception:
             log.exception('unexpected error')
-            self.sentry.captureException()
+            self.error_monitor.capture_exception()
             raise
 
     @aiozmq.rpc.method
@@ -503,24 +570,33 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         return msg
 
     @aiozmq.rpc.method
+    @update_last_used
+    async def ping_kernel(self, kernel_id: str):
+        log.debug('rpc::ping_kernel({0})', kernel_id)
+
+    @aiozmq.rpc.method
+    @update_last_used
     async def create_kernel(self, kernel_id: str, config: dict) -> dict:
-        log.debug('rpc::create_kernel({0})', config['lang'])
+        log.debug('rpc::create_kernel({0}, {1})', kernel_id, config['lang'])
         async with self.handle_rpc_exception():
             return await self._create_kernel(kernel_id, config)
 
     @aiozmq.rpc.method
+    @update_last_used
     async def destroy_kernel(self, kernel_id: str):
         log.debug('rpc::destroy_kernel({0})', kernel_id)
         async with self.handle_rpc_exception():
             return await self._destroy_kernel(kernel_id, 'user-requested')
 
     @aiozmq.rpc.method
+    @update_last_used
     async def interrupt_kernel(self, kernel_id: str):
         log.debug('rpc::interrupt_kernel({0})', kernel_id)
         async with self.handle_rpc_exception():
             await self._interrupt_kernel(kernel_id)
 
     @aiozmq.rpc.method
+    @update_last_used
     async def get_completions(self, kernel_id: str,
                               text: str, opts: dict):
         log.debug('rpc::get_completions({0})', kernel_id)
@@ -528,12 +604,14 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
             await self._get_completions(kernel_id, text, opts)
 
     @aiozmq.rpc.method
+    @update_last_used
     async def get_logs(self, kernel_id: str):
         log.debug('rpc::get_logs({0})', kernel_id)
         async with self.handle_rpc_exception():
             return await self._get_logs(kernel_id)
 
     @aiozmq.rpc.method
+    @update_last_used
     async def restart_kernel(self, kernel_id: str, new_config: dict):
         log.debug('rpc::restart_kernel({0})', kernel_id)
         async with self.handle_rpc_exception():
@@ -548,7 +626,7 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 await self._destroy_kernel(kernel_id, 'restarting')
                 # clean_kernel() will set tracker.destroy_event
                 try:
-                    with timeout(10):
+                    with timeout(30):
                         await tracker.destroy_event.wait()
                 except asyncio.TimeoutError:
                     log.warning('timeout detected while restarting kernel {0}!',
@@ -570,6 +648,7 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 'repl_out_port': kernel_info['repl_out_port'],
                 'stdin_port': kernel_info['stdin_port'],
                 'stdout_port': kernel_info['stdout_port'],
+                'service_ports': kernel_info['service_ports'],
             }
 
     @aiozmq.rpc.method
@@ -578,32 +657,45 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                       run_id: t.String | t.Null,
                       mode: str,
                       code: str,
-                      opts: dict) -> dict:
+                      opts: dict,
+                      flush_timeout: t.Float | t.Null) -> dict:
         log.debug('rpc::execute({0})', kernel_id)
         async with self.handle_rpc_exception():
             result = await self._execute(api_version, kernel_id,
-                                         run_id, mode, code, opts)
+                                         run_id, mode, code, opts,
+                                         flush_timeout)
             return result
 
     @aiozmq.rpc.method
+    @update_last_used
+    async def start_service(self, kernel_id: str, service: str, opts: dict):
+        log.debug('rpc::start_service({0}, {1})', kernel_id, service)
+        async with self.handle_rpc_exception():
+            return await self._start_service(kernel_id, service, opts)
+
+    @aiozmq.rpc.method
+    @update_last_used
     async def upload_file(self, kernel_id: str, filename: str, filedata: bytes):
         log.debug('rpc::upload_file({0}, {1})', kernel_id, filename)
         async with self.handle_rpc_exception():
             await self._accept_file(kernel_id, filename, filedata)
 
     @aiozmq.rpc.method
+    @update_last_used
     async def download_file(self, kernel_id: str, filepath: str):
         log.debug('rpc::download_file({0}, {1})', kernel_id, filepath)
         async with self.handle_rpc_exception():
             return await self._download_file(kernel_id, filepath)
 
     @aiozmq.rpc.method
+    @update_last_used
     async def list_files(self, kernel_id: str, path: str):
         log.debug('rpc::list_files({0}, {1})', kernel_id, path)
         async with self.handle_rpc_exception():
             return await self._list_files(kernel_id, path)
 
     @aiozmq.rpc.method
+    @update_last_used
     async def reset(self):
         log.debug('rpc::reset()')
         async with self.handle_rpc_exception():
@@ -615,7 +707,7 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                         self._destroy_kernel(kernel_id, 'agent-reset'))
                     tasks.append(task)
                 except Exception:
-                    self.sentry.captureException()
+                    self.error_monitor.capture_exception()
                     log.exception('reset: destroying {0}', kernel_id)
             await asyncio.gather(*tasks)
 
@@ -624,20 +716,20 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         await self.send_event('kernel_creating', kernel_id)
 
         # Read image-specific labels and settings
+        image_ref = ImageRef(kernel_config['lang'])
+        assert not image_ref.resolve_required(), \
+               'The manager should have resolved the image reference!'
 
-        if '/' in kernel_config['lang']:
-            tokens = kernel_config['lang'].split('/')
-            docker_registry = '/'.join(tokens[:-1])
-            lang = tokens[-1]
-        else:
-            # Support for legacy
-            docker_registry = 'lablup'
-            lang = kernel_config['lang']
         environ: dict = kernel_config.get('environ', {})
-        extra_mount_list = await get_extra_volumes(self.docker, lang)
+        extra_mount_list = await get_extra_volumes(self.docker, image_ref.short)
 
-        image_name = f'{docker_registry}/kernel-{lang}'
-        image_props = await self.docker.images.get(image_name)
+        try:
+            image_props = await self.docker.images.get(image_ref.canonical)
+        except DockerError as e:
+            if e.status == 404:
+                await self.docker.images.pull(image_ref.canonical)
+            else:
+                raise
         image_labels = image_props['ContainerConfig']['Labels']
 
         version        = int(get_label(image_labels, 'version', '1'))
@@ -647,8 +739,8 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         kernel_features = set(get_label(image_labels, 'features', '').split())
 
         scratch_dir = self.config.scratch_root / kernel_id
-        work_dir = (scratch_dir / '.work').resolve()
-        config_dir = (scratch_dir / '.config').resolve()
+        config_dir = (scratch_dir / 'config').resolve()
+        work_dir = (scratch_dir / 'work').resolve()
 
         # PHASE 1: Read existing resource spec or devise a new resource spec.
 
@@ -680,19 +772,20 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         # PHASE 2: Apply the resource spec.
 
         # Inject Backend.AI-intrinsic env-variables for gosu
+        # TODO: remove this!
         if KernelFeatures.UID_MATCH in kernel_features:
             environ['LOCAL_USER_ID'] = os.getuid()
 
         # Inject Backend.AI-intrinsic mount points and extra mounts
         binds = [
-            f'{config_dir}:/home/work/.config:ro',
-            f'{work_dir}:/home/work:rw',
+            f'{config_dir}:/home/config:ro',
+            f'{work_dir}:/home/work/:rw',
         ]
         binds.extend(f'{v.name}:{v.container_path}:{v.mode}'
                      for v in extra_mount_list)
         volumes = [
-            '/home/work/.config',
-            '/home/work/.work',
+            '/home/config',
+            '/home/work',
         ]
         volumes.extend(v.container_path for v in extra_mount_list)
 
@@ -818,37 +911,51 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         #     by the plugin implementation.
 
         # Mount the in-kernel packaes/binaries directly from the host for debugging.
+        def _mount(host_path, container_path, perm='ro'):
+            nonlocal volumes, binds
+            binds.append(f'{host_path}:{container_path}:{perm}')
+
         if self.config.debug_kernel is not None:
-            container_pkg_path = ('/usr/local/lib/python3.6/'
-                                  'site-packages/ai/backend/')
-            volumes.append(container_pkg_path)
-            binds.append(f'{self.config.debug_kernel}:{container_pkg_path}:ro')
+            _mount(self.config.debug_kernel,
+                   '/usr/local/lib/python3.6/site-packages/ai/backend/')
         if self.config.debug_hook is not None:
-            container_pkg_path = '/home/backend.ai/libbaihook.so'
-            volumes.append(container_pkg_path)
-            binds.append(f'{self.config.debug_hook}:{container_pkg_path}:ro')
-            container_pkg_path = '/home/sorna/libbaihook.so'
-            volumes.append(container_pkg_path)
-            binds.append(f'{self.config.debug_hook}:{container_pkg_path}:ro')
+            _mount(self.config.debug_hook, '/home/backend.ai/libbaihook.so')
+            _mount(self.config.debug_hook, '/home/sorna/libbaihook.so')
         if self.config.debug_jail is not None:
-            container_pkg_path = '/home/backend.ai/jail'
-            volumes.append(container_pkg_path)
-            binds.append(f'{self.config.debug_jail}:{container_pkg_path}:ro')
-            container_pkg_path = '/home/sorna/jail'
-            volumes.append(container_pkg_path)
-            binds.append(f'{self.config.debug_jail}:{container_pkg_path}:ro')
+            _mount(self.config.debug_jail, '/home/backend.ai/jail')
+            _mount(self.config.debug_jail, '/home/sorna/jail')
+
+        exposed_ports = [2000, 2001]
+        service_ports = {}
+        for item in get_label(image_labels, 'service-ports', '').split(','):
+            if not item:
+                continue
+            service_port = parse_service_port(item)
+            container_port = service_port['container_port']
+            service_ports[container_port] = service_port
+            exposed_ports.append(container_port)
+        if 'git' in image_ref.name:  # legacy (TODO: remove it!)
+            exposed_ports.append(2002)
+            exposed_ports.append(2003)
+        log.debug('exposed ports: {!r}', exposed_ports)
+
+        if len(exposed_ports) > len(self.port_pool):
+            raise RuntimeError('Container ports are not sufficiently available.')
+        host_ports = []
+        for eport in exposed_ports:
+            hport = self.port_pool.pop()
+            host_ports.append(hport)
+
         container_config = {
-            'Image': image_name,
+            'Image': image_ref.canonical,
             'Tty': True,
+            # TODO: 'User': str(os.getuid()),
             'OpenStdin': True,
             'Privileged': False,
             'Volumes': {v: {} for v in volumes},
             'StopSignal': 'SIGINT',
             'ExposedPorts': {
-                '2000/tcp': {},
-                '2001/tcp': {},
-                '2002/tcp': {},
-                '2003/tcp': {},
+                f'{port}/tcp': {} for port in exposed_ports
             },
             'Env': [f'{k}={v}' for k, v in environ.items()],
             'HostConfig': {
@@ -860,42 +967,70 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 'CpusetMems': f'{resource_spec.numa_node}',
                 'SecurityOpt': ['seccomp=unconfined'],
                 'Binds': binds,
-                'PublishAllPorts': True,
+                'PortBindings': {
+                    f'{eport}/tcp': [{'HostPort': str(hport)}]
+                    for eport, hport in zip(exposed_ports, host_ports)
+                },
+                'PublishAllPorts': False,  # we manage port mapping manually!
             },
         }
         update_nested_dict(container_config, accel_docker_args)
-        base_name, _, tag = lang.partition(':')
-        kernel_name = f'kernel.{base_name}.{kernel_id}'
-        container = await self.docker.containers.create(
-            config=container_config, name=kernel_name)
-        cid = container._id
+        kernel_name = f'kernel.{image_ref.name}.{kernel_id}'
+        log.debug('container config: {!r}', container_config)
 
-        cgroup_available = (not identity.is_containerized() and
-                            sys.platform.startswith('linux'))
-        stat_addr = f'tcp://{self.config.agent_host}:{self.config.stat_port}'
-        stat_type = 'cgroup' if cgroup_available else 'api'
-        self.stats[cid] = StatCollectorState(kernel_id)
-        async with spawn_stat_collector(stat_addr, stat_type, cid):
-            await container.start()
+        # We are all set! Create and start the container.
+        try:
+            container = await self.docker.containers.create(
+                config=container_config, name=kernel_name)
+            cid = container._id
 
-        repl_in_port  = (await container.port(2000))[0]['HostPort']
-        repl_out_port = (await container.port(2001))[0]['HostPort']
-        stdin_port  = (await container.port(2002))[0]['HostPort']
-        stdout_port = (await container.port(2003))[0]['HostPort']
+            stat_addr = f'tcp://{self.config.agent_host}:{self.config.stat_port}'
+            stat_type = get_preferred_stat_type()
+            self.stats[cid] = StatCollectorState(kernel_id)
+            async with spawn_stat_collector(stat_addr, stat_type, cid):
+                await container.start()
+        except Exception:
+            # Oops, we have to restore the allocated resources!
+            shutil.rmtree(scratch_dir)
+            self.port_pool.update(host_ports)
+            self.container_cpu_map.free(resource_spec.cpu_set)
+            for dev_type, dev_shares in resource_spec.shares.items():
+                if dev_type in KernelResourceSpec.reserved_share_types:
+                    continue
+                self.accelerators[dev_type].alloc_map.free(dev_shares)
+            raise
+
+        stdin_port = 0
+        stdout_port = 0
+        for idx, port in enumerate(exposed_ports):
+            host_port = int((await container.port(port))[0]['HostPort'])
+            assert host_port == host_ports[idx]
+            if port in service_ports:
+                service_ports[port]['host_port'] = host_port
+            elif port == 2000:     # intrinsic
+                repl_in_port = host_port
+            elif port == 2001:     # intrinsic
+                repl_out_port = host_port
+            elif port == 2002:     # legacy
+                stdin_port = host_port
+            elif port == 2003:  # legacy
+                stdout_port = host_port
         if self.config.kernel_host_override:
             kernel_host = self.config.kernel_host_override
         else:
             kernel_host = self.config.agent_host
 
         self.container_registry[kernel_id] = {
-            'lang': f'{docker_registry}/{lang}',
+            'lang': image_ref,
             'version': version,
             'container_id': container._id,
             'kernel_host': kernel_host,
             'repl_in_port': repl_in_port,
             'repl_out_port': repl_out_port,
-            'stdin_port': stdin_port,
-            'stdout_port': stdout_port,
+            'stdin_port': stdin_port,    # legacy
+            'stdout_port': stdout_port,  # legacy
+            'service_ports': list(service_ports.values()),
+            'host_ports': host_ports,
             'exec_timeout': exec_timeout,
             'last_used': time.monotonic(),
             'runner_tasks': set(),
@@ -903,15 +1038,16 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         }
         log.debug('kernel repl-in address: {0}:{1}', kernel_host, repl_in_port)
         log.debug('kernel repl-out address: {0}:{1}', kernel_host, repl_out_port)
-        log.debug('kernel stdin address: {0}:{1}', kernel_host, stdin_port)
-        log.debug('kernel stdout address: {0}:{1}', kernel_host, stdout_port)
+        for service_port in service_ports.values():
+            log.debug('service port: {!r}', service_port)
         return {
             'id': kernel_id,
             'kernel_host': kernel_host,
-            'repl_in_port': int(repl_in_port),
-            'repl_out_port': int(repl_out_port),
-            'stdin_port': int(stdin_port),
-            'stdout_port': int(stdout_port),
+            'repl_in_port': repl_in_port,
+            'repl_out_port': repl_out_port,
+            'stdin_port': stdin_port,    # legacy
+            'stdout_port': stdout_port,  # legacy
+            'service_ports': list(service_ports.values()),
             'container_id': container._id,
             'resource_spec': resource_spec.to_json(),
         }
@@ -957,43 +1093,47 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 pass
             else:
                 log.exception('_destroy_kernel({0}) kill error', kernel_id)
-                self.sentry.captureException()
+                self.error_monitor.capture_exception()
         except Exception:
             log.exception('_destroy_kernel({0}) unexpected error', kernel_id)
-            self.sentry.captureException()
+            self.error_monitor.capture_exception()
 
     async def _ensure_runner(self, kernel_id, *, api_version=3):
         # TODO: clean up
-        runner = self.container_registry[kernel_id].get('runner')
-        if runner is not None:
-            log.debug('_execute_code:v{0}({1}) use '
-                      'existing runner', api_version, kernel_id)
-        else:
-            client_features = {'input', 'continuation'}
-            runner = KernelRunner(
-                kernel_id,
-                self.container_registry[kernel_id]['kernel_host'],
-                self.container_registry[kernel_id]['repl_in_port'],
-                self.container_registry[kernel_id]['repl_out_port'],
-                self.container_registry[kernel_id]['exec_timeout'],
-                client_features)
-            log.debug('_execute:v{0}({1}) start new runner', api_version, kernel_id)
-            self.container_registry[kernel_id]['runner'] = runner
-            # TODO: restoration of runners after agent restarts
-            await runner.start()
-        return runner
+        async with self.runner_lock:
+            runner = self.container_registry[kernel_id].get('runner')
+            if runner is not None:
+                log.debug('_execute_code:v{0}({1}) use '
+                          'existing runner', api_version, kernel_id)
+            else:
+                client_features = {'input', 'continuation'}
+                runner = KernelRunner(
+                    kernel_id,
+                    self.container_registry[kernel_id]['kernel_host'],
+                    self.container_registry[kernel_id]['repl_in_port'],
+                    self.container_registry[kernel_id]['repl_out_port'],
+                    self.container_registry[kernel_id]['exec_timeout'],
+                    client_features)
+                log.debug('_execute:v{0}({1}) start new runner',
+                          api_version, kernel_id)
+                self.container_registry[kernel_id]['runner'] = runner
+                # TODO: restoration of runners after agent restarts
+                await runner.start()
+            return runner
 
-    async def _execute(self, api_version, kernel_id, run_id, mode, text, opts):
+    async def _execute(self, api_version, kernel_id,
+                       run_id, mode, text, opts,
+                       flush_timeout):
         # Save kernel-generated output files in a separate sub-directory
         # (to distinguish from user-uploaded files)
-        output_dir = self.config.scratch_root / kernel_id / '.work' / '.output'
+        output_dir = self.config.scratch_root / kernel_id / 'work' / '.output'
 
         restart_tracker = self.restarting_kernels.get(kernel_id)
         if restart_tracker:
             await restart_tracker.done_event.wait()
 
         try:
-            self.container_registry[kernel_id]['last_used'] = time.monotonic()
+            kernel_info = self.container_registry[kernel_id]
         except KeyError:
             await self.send_event('kernel_terminated',
                                   kernel_id, 'self-terminated',
@@ -1001,16 +1141,17 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
             raise RuntimeError(f'The container for kernel {kernel_id} is not found! '
                                '(might be terminated--try it again)') from None
 
+        kernel_info['last_used'] = time.monotonic()
         runner = await self._ensure_runner(kernel_id, api_version=api_version)
 
         try:
             myself = asyncio.Task.current_task()
-            self.container_registry[kernel_id]['runner_tasks'].add(myself)
+            kernel_info['runner_tasks'].add(myself)
 
             await runner.attach_output_queue(run_id)
 
             if mode == 'batch' or mode == 'query':
-                self.container_registry[kernel_id]['initial_file_stats'] \
+                kernel_info['initial_file_stats'] \
                     = scandir(output_dir, max_upload_size)
             if mode == 'batch':
                 await runner.feed_batch(opts)
@@ -1020,11 +1161,13 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
                 await runner.feed_input(text)
             elif mode == 'continue':
                 pass
-            result = await runner.get_next_result(api_ver=api_version)
+            result = await runner.get_next_result(
+                api_ver=api_version,
+                flush_timeout=flush_timeout)
 
         except asyncio.CancelledError:
             await runner.close()
-            self.container_registry[kernel_id].pop('runner', None)
+            kernel_info.pop('runner', None)
             return
         finally:
             runner_tasks = utils.nmget(self.container_registry,
@@ -1042,11 +1185,11 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
             if utils.nmget(result, 'options.upload_output_files', True):
                 # TODO: separate as a new task
                 initial_file_stats = \
-                    self.container_registry[kernel_id]['initial_file_stats']
+                    kernel_info['initial_file_stats']
                 output_files = await upload_output_files_to_s3(
                     initial_file_stats, final_file_stats, output_dir, kernel_id)
 
-            self.container_registry[kernel_id].pop('initial_file_stats', None)
+            kernel_info.pop('initial_file_stats', None)
 
         if (result['status'] == 'exec-timeout' and
                 kernel_id in self.container_registry):
@@ -1075,9 +1218,25 @@ class AgentRPCServer(aiozmq.rpc.AttrHandler):
         await runner.feed_interrupt()
         return {'status': 'finished'}
 
+    async def _start_service(self, kernel_id, service, opts):
+        runner = await self._ensure_runner(kernel_id)
+        service_ports = self.container_registry[kernel_id]['service_ports']
+        for sport in service_ports:
+            if sport['name'] == service:
+                break
+        else:
+            return {'status': 'failed', 'error': 'invalid service name'}
+        result = await runner.feed_start_service({
+            'name': service,
+            'port': sport['container_port'],
+            'protocol': sport['protocol'],
+            'options': opts,
+        })
+        return result
+
     async def _accept_file(self, kernel_id, filename, filedata):
         loop = asyncio.get_event_loop()
-        work_dir = self.config.scratch_root / kernel_id / '.work'
+        work_dir = self.config.scratch_root / kernel_id / 'work'
         try:
             # create intermediate directories in the path
             dest_path = (work_dir / filename).resolve(strict=False)
@@ -1166,6 +1325,7 @@ print(json.dumps(files))''' % {'path': path}
         '''
         Send my status information and available kernel images.
         '''
+        await collect_agent_live_stats(self)
         agent_info = {
             'ip': self.config.agent_host,
             'region': self.config.region,
@@ -1182,7 +1342,7 @@ print(json.dumps(files))''' % {'path': path}
             log.warning('event dispatch timeout: instance_heartbeat')
         except Exception:
             log.exception('instance_heartbeat failure')
-            self.sentry.captureException()
+            self.error_monitor.capture_exception()
 
     async def fetch_docker_events(self):
         while True:
@@ -1200,7 +1360,7 @@ print(json.dumps(files))''' % {'path': path}
                 break
             except Exception:
                 log.exception('unexpected error')
-                self.sentry.captureException()
+                self.error.capture_exception()
                 break
 
     async def monitor(self):
@@ -1247,19 +1407,31 @@ print(json.dumps(files))''' % {'path': path}
 
     async def clean_kernel(self, kernel_id):
         try:
-            container_id = self.container_registry[kernel_id]['container_id']
+            kernel_info = self.container_registry[kernel_id]
+
+            container_id = kernel_info['container_id']
             container = self.docker.containers.container(container_id)
-            await self.clean_runner(kernel_id)
             try:
-                if not self.config.debug_skip_container_deletion:
-                    await container.delete()
-            except DockerError as e:
-                if e.status == 409 and 'already in progress' in e.message:
-                    pass
-                elif e.status == 404:
-                    pass
-                else:
-                    log.warning('container deletion: {0!r}', e)
+                await self.clean_runner(kernel_id)
+            finally:
+                # When the agent restarts with a different port range, existing
+                # containers' host ports may not belong to the new port range.
+                try:
+                    if not self.config.debug_skip_container_deletion:
+                        await container.delete()
+                except DockerError as e:
+                    if e.status == 409 and 'already in progress' in e.message:
+                        pass
+                    elif e.status == 404:
+                        pass
+                    else:
+                        log.warning('container deletion: {0!r}', e)
+                finally:
+                    port_range = self.config.container_port_range
+                    restored_ports = [*filter(
+                        lambda p: port_range[0] <= p <= port_range[1],
+                        kernel_info['host_ports'])]
+                    self.port_pool.update(restored_ports)
         except KeyError:
             pass
         if kernel_id in self.restarting_kernels:
@@ -1320,7 +1492,7 @@ print(json.dumps(files))''' % {'path': path}
                 self.blocking_cleans.pop(kernel_id, None)
 
 
-@aiotools.actxmgr
+@aiotools.server
 async def server_main(loop, pidx, _args):
 
     args = _args[0]
@@ -1341,11 +1513,11 @@ async def server_main(loop, pidx, _args):
 
     # Run!
     try:
-        yield
+        stop_signal = yield
     finally:
         # Shutdown.
         log.info('shutting down...')
-        await agent.shutdown()
+        await agent.shutdown(stop_signal)
 
 
 def main():
@@ -1369,6 +1541,10 @@ def main():
                env_var='BACKEND_STAT_PORT',
                help='The port number to receive statistics reports from '
                     'local containers.')
+    parser.add('--container-port-range', type=port_range, default=(30000, 31000),
+               env_var='BACKEND_CONTAINER_PORT_RANGE',
+               help='The range of host public ports to be used by containers '
+                    '(inclusive)')
     parser.add('--etcd-addr', type=host_port_pair,
                env_var='BACKEND_ETCD_ADDR',
                default=HostPortPair(ip_address('127.0.0.1'), 2379),
@@ -1409,27 +1585,18 @@ def main():
                default=Path('/var/cache/scratches'),
                env_var='BACKEND_SCRATCH_ROOT',
                help='The scratch directory to store container working directories.')
-    if datadog_available:
-        parser.add('--datadog-api-key', env_var='DATADOG_API_KEY',
-                   type=str, default=None,
-                   help='The API key for Datadog monitoring agent.')
-        parser.add('--datadog-app-key', env_var='DATADOG_APP_KEY',
-                   type=str, default=None,
-                   help='The application key for Datadog monitoring agent.')
-    if raven_available:
-        parser.add('--raven-uri', env_var='RAVEN_URI', type=str, default=None,
-                   help='The sentry.io event report URL with DSN.')
+
+    plugins = [
+        'stats_monitor',
+        'error_monitor',
+    ]
+    add_plugin_args(parser, plugins)
+
     Logger.update_log_args(parser)
     args = parser.parse_args()
 
     assert args.scratch_root.exists()
     assert args.scratch_root.is_dir()
-
-    if datadog_available and args.datadog_api_key:
-        datadog.initialize(
-            api_key=args.datadog_api_key,
-            app_key=args.datadog_app_key,
-        )
 
     if args.debug_kernel is not None:
         args.debug_kernel = args.debug_kernel.resolve()
@@ -1451,6 +1618,7 @@ def main():
     logger.add_pkg('aiodocker')
     logger.add_pkg('aiotools')
     logger.add_pkg('ai.backend')
+    setproctitle(f'backend.ai: agent {args.namespace} *:{args.agent_port}')
 
     with logger:
         log.info('Backend.AI Agent {0}', VERSION)

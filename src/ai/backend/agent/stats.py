@@ -20,21 +20,25 @@ import aiohttp
 from aiodocker.docker import Docker, DockerContainer
 from aiodocker.exceptions import DockerError
 import aiotools
+from setproctitle import setproctitle
 import zmq
 import zmq.asyncio
 
 from ai.backend.common import msgpack
 from ai.backend.common.utils import nmget
+from ai.backend.common.logging import Logger, BraceStyleAdapter
 from ai.backend.common.identity import is_containerized
 
 __all__ = (
     'ContainerStat',
     'StatCollectorState',
+    'check_cgroup_available',
+    'get_preferred_stat_type',
     'spawn_stat_collector',
     'numeric_list', 'read_sysfs',
 )
 
-log = logging.getLogger('ai.backend.agent.stats')
+log = BraceStyleAdapter(logging.getLogger('ai.backend.agent.stats'))
 
 CLONE_NEWNET = 0x40000000
 
@@ -45,9 +49,28 @@ def _errcheck(ret, func, args):
         raise OSError(e, os.strerror(e))
 
 
+def check_cgroup_available():
+    '''
+    Check if the host OS provides cgroups.
+    '''
+    return (not is_containerized() and sys.platform.startswith('linux'))
+
+
+def get_preferred_stat_type():
+    '''
+    Returns the most preferred statistics collector type for the host OS.
+    '''
+    if check_cgroup_available():
+        return 'cgroup'
+    return 'api'
+
+
 @dataclass(frozen=False)
 class ContainerStat:
+    precpu_used: int = 0
     cpu_used: int = 0
+    precpu_system_used: int = 0
+    cpu_system_used: int = 0
     mem_max_bytes: int = 0
     mem_cur_bytes: int = 0
     net_rx_bytes: int = 0
@@ -60,7 +83,10 @@ class ContainerStat:
     def update(self, stat: 'ContainerStat'):
         if stat is None:
             return
+        self.precpu_used = self.cpu_used
         self.cpu_used = stat.cpu_used
+        self.precpu_system_used = self.cpu_system_used
+        self.cpu_system_used = stat.cpu_system_used
         self.mem_max_bytes = stat.mem_max_bytes
         self.mem_cur_bytes = stat.mem_cur_bytes
         self.net_rx_bytes = max(self.net_rx_bytes, stat.net_rx_bytes)
@@ -77,6 +103,38 @@ class StatCollectorState:
     kernel_id: str
     last_stat: ContainerStat = None
     terminated: asyncio.Event = field(default_factory=lambda: asyncio.Event())
+
+
+async def collect_agent_live_stats(agent):
+    """Store agent live stats in redis stats server.
+    """
+    from .server import stat_cache_lifespan
+    num_cores = agent.container_cpu_map.num_cores
+    precpu_used = cpu_used = mem_cur_bytes = 0
+    precpu_sys_used = cpu_sys_used = 0
+    for cid, cstate in agent.stats.items():
+        if not cstate.terminated.is_set() and cstate.last_stat is not None:
+            precpu_used += float(cstate.last_stat['precpu_used'])
+            cpu_used += float(cstate.last_stat['cpu_used'])
+            precpu_sys_used += float(cstate.last_stat['precpu_system_used'])
+            cpu_sys_used += float(cstate.last_stat['cpu_system_used'])
+            mem_cur_bytes += int(cstate.last_stat['mem_cur_bytes'])
+
+    # CPU usage calculation ref: https://bit.ly/2rrfrFF
+    cpu_delta = cpu_used - precpu_used
+    system_delta = cpu_sys_used - precpu_sys_used
+    cpu_pct = 0
+    if system_delta > 0 and cpu_delta > 0:
+        cpu_pct = (cpu_delta / system_delta) * num_cores * 100
+
+    agent_live_info = {
+        'cpu_pct': round(cpu_pct, 1),
+        'mem_cur_bytes': mem_cur_bytes,
+    }
+    pipe = agent.redis_stat_pool.pipeline()
+    pipe.hmset_dict(agent.config.instance_id, agent_live_info)
+    pipe.expire(agent.config.instance_id, stat_cache_lifespan)
+    await pipe.execute()
 
 
 @aiotools.actxmgr
@@ -100,8 +158,8 @@ async def spawn_stat_collector(stat_addr, stat_type, cid, *,
     signal_path = 'ipc://' + str(ipc_base_path / f'stat-start-{proc.pid}.sock')
     signal_sock = context.socket(zmq.PAIR)
     signal_sock.connect(signal_path)
-    await signal_sock.recv_multipart()
     try:
+        await signal_sock.recv_multipart()
         yield proc
     finally:
         await signal_sock.send_multipart([b''])
@@ -116,6 +174,7 @@ def _collect_stats_sysfs(container_id):
 
     try:
         cpu_used = read_sysfs(cpu_prefix + 'cpuacct.usage') / 1e6
+        cpu_system_used = read_sysfs('/sys/fs/cgroup/cpuacct/cpuacct.usage') / 1e6
         mem_max_bytes = read_sysfs(mem_prefix + 'memory.max_usage_in_bytes')
         mem_cur_bytes = read_sysfs(mem_prefix + 'memory.usage_in_bytes')
 
@@ -163,7 +222,10 @@ def _collect_stats_sysfs(container_id):
         return None
 
     return ContainerStat(
+        0,  # precpu_used calculated automatically
         cpu_used,
+        0,  # precpu_system_used calculated autmatically
+        cpu_system_used,
         mem_max_bytes,
         mem_cur_bytes,
         net_rx_bytes,
@@ -189,6 +251,7 @@ async def _collect_stats_api(container):
         if ret['preread'].startswith('0001-01-01'):
             return None
         cpu_used = nmget(ret, 'cpu_stats.cpu_usage.total_usage', 0) / 1e6
+        cpu_system_used = nmget(ret, 'cpu_stats.system_cpu_usage', 0) / 1e6
         mem_max_bytes = nmget(ret, 'memory_stats.max_usage', 0)
         mem_cur_bytes = nmget(ret, 'memory_stats.usage', 0)
 
@@ -208,7 +271,10 @@ async def _collect_stats_api(container):
             net_rx_bytes += dev['rx_bytes']
             net_tx_bytes += dev['tx_bytes']
     return ContainerStat(
+        0,  # precpu_used calculated automatically
         cpu_used,
+        0,  # precpu_system_used calculated autmatically
+        cpu_system_used,
         mem_max_bytes,
         mem_cur_bytes,
         net_rx_bytes,
@@ -221,7 +287,7 @@ async def _collect_stats_api(container):
 
 
 async def collect_stats(containers):
-    if sys.platform == 'linux' and not is_containerized():
+    if check_cgroup_available():
         results = tuple(_collect_stats_sysfs(c._id) for c in containers)
     else:
         tasks = []
@@ -323,9 +389,13 @@ def join_cgroup_and_namespace(cid, initial_stat, send_stat, signal_sock):
 
 
 def is_cgroup_running(cid):
-    pids = Path(f'/sys/fs/cgroup/net_cls/docker/{cid}/cgroup.procs').read_text()
-    pids = numeric_list(pids)
-    return (len(pids) > 1)
+    try:
+        pids = Path(f'/sys/fs/cgroup/net_cls/docker/{cid}/cgroup.procs').read_text()
+        pids = numeric_list(pids)
+    except IOError:
+        return False
+    else:
+        return (len(pids) > 1)
 
 
 def main(args):
@@ -333,65 +403,75 @@ def main(args):
     mypid = os.getpid()
 
     ipc_base_path = Path('/tmp/backend.ai/ipc')
-    signal_path = 'ipc://' + str(ipc_base_path / f'stat-start-{mypid}.sock')
+    signal_path = str(ipc_base_path / f'stat-start-{mypid}.sock')
+    log.debug('creating signal socket at {}', signal_path)
     signal_sock = context.socket(zmq.PAIR)
-    signal_sock.bind(signal_path)
+    signal_sock.bind('ipc://' + signal_path)
+    try:
 
-    stats_sock = context.socket(zmq.PUSH)
-    stats_sock.setsockopt(zmq.LINGER, 2000)
-    stats_sock.connect(args.sockaddr)
-    send_stat = functools.partial(
-        stats_sock.send_serialized,
-        serialize=lambda v: [msgpack.packb(v)])
-    stat = ContainerStat()
+        stats_sock = context.socket(zmq.PUSH)
+        stats_sock.setsockopt(zmq.LINGER, 2000)
+        stats_sock.connect(args.sockaddr)
+        send_stat = functools.partial(
+            stats_sock.send_serialized,
+            serialize=lambda v: [msgpack.packb(v)])
+        stat = ContainerStat()
+        log.info('started statistics collection for {}', args.cid)
 
-    if args.type == 'cgroup':
-        with closing(stats_sock), join_cgroup_and_namespace(args.cid, stat,
-                                                            send_stat, signal_sock):
-            # Agent notification is done inside join_cgroup_and_namespace
-            while True:
-                new_stat = _collect_stats_sysfs(args.cid)
-                stat.update(new_stat)
-                msg = {
-                    'cid': args.cid,
-                    'data': asdict(stat),
-                }
-                if is_cgroup_running(args.cid) and new_stat is not None:
-                    msg['status'] = 'running'
-                    send_stat(msg)
-                else:
-                    msg['status'] = 'terminated'
-                    send_stat(msg)
-                    break
-                time.sleep(1.0)
-    elif args.type == 'api':
-        loop = asyncio.get_event_loop()
-        docker = Docker()
-        with closing(stats_sock), closing(loop):
-            container = DockerContainer(docker, id=args.cid)
-            # Notify the agent to start the container.
-            signal_sock.send_multipart([b''])
-            # Wait for the container to be actually started.
-            signal_sock.recv_multipart()
-            while True:
-                new_stat = loop.run_until_complete(_collect_stats_api(container))
-                stat.update(new_stat)
-                msg = {
-                    'cid': args.cid,
-                    'data': asdict(stat),
-                }
-                if new_stat is not None:
-                    msg['status'] = 'running'
-                    send_stat(msg)
-                else:
-                    msg['status'] = 'terminated'
-                    send_stat(msg)
-                    break
-                time.sleep(1.0)
-            loop.run_until_complete(docker.close())
+        if args.type == 'cgroup':
+            with closing(stats_sock), join_cgroup_and_namespace(args.cid, stat,
+                                                                send_stat,
+                                                                signal_sock):
+                # Agent notification is done inside join_cgroup_and_namespace
+                while True:
+                    new_stat = _collect_stats_sysfs(args.cid)
+                    stat.update(new_stat)
+                    msg = {
+                        'cid': args.cid,
+                        'data': asdict(stat),
+                    }
+                    if is_cgroup_running(args.cid) and new_stat is not None:
+                        msg['status'] = 'running'
+                        send_stat(msg)
+                    else:
+                        msg['status'] = 'terminated'
+                        send_stat(msg)
+                        break
+                    time.sleep(1.0)
+        elif args.type == 'api':
+            loop = asyncio.get_event_loop()
+            docker = Docker()
+            with closing(stats_sock), closing(loop):
+                container = DockerContainer(docker, id=args.cid)
+                # Notify the agent to start the container.
+                signal_sock.send_multipart([b''])
+                # Wait for the container to be actually started.
+                signal_sock.recv_multipart()
+                while True:
+                    new_stat = loop.run_until_complete(_collect_stats_api(container))
+                    stat.update(new_stat)
+                    msg = {
+                        'cid': args.cid,
+                        'data': asdict(stat),
+                    }
+                    if new_stat is not None:
+                        msg['status'] = 'running'
+                        send_stat(msg)
+                    else:
+                        msg['status'] = 'terminated'
+                        send_stat(msg)
+                        break
+                    time.sleep(1.0)
+                loop.run_until_complete(docker.close())
 
-    signal_sock.close()
-    sys.exit(0)
+    except (KeyboardInterrupt, SystemExit):
+        sys.exit(1)
+    else:
+        sys.exit(0)
+    finally:
+        signal_sock.close()
+        os.unlink(signal_path)
+        log.info('terminated statistics collection for {}', args.cid)
 
 
 if __name__ == '__main__':
@@ -402,4 +482,11 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--type', choices=['cgroup', 'api'],
                         default='cgroup')
     args = parser.parse_args()
-    main(args)
+    setproctitle(f'backend.ai: stat-collector {args.cid[:7]}')
+
+    log_config = argparse.Namespace()
+    log_config.log_file = None
+    log_config.debug = False
+    logger = Logger(log_config)
+    with logger:
+        main(args)

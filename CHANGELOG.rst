@@ -1,11 +1,46 @@
 Changes
 =======
 
-1.5.0 (to be released)
+18.12.0 (to be released)
+------------------------
+
+- Version numbers now follow year.month releases like Docker.
+  We plan to release stable versions on every 3 months (e.g., 18.12, 19.03, ...).
+
+18.12.0a3 (2018-12-21)
 ----------------------
 
-1.4.0 (to be released)
+- Technical release to fix the backend.ai-common dependency version.
+
+18.12.0a2 (2018-12-21)
 ----------------------
+
+- NEW: Supports user-specified ranges for the service ports published by containers
+  via the ``--container-port-range`` CLI argument for firewall-sensitive setups.
+  (The default range is 30000-31000) (#90)
+
+- CHANGE: The agent now automatically pulls the image if not available in the host.
+
+- CHANGE: The process monitoring tools will now show prettified process names for
+  Backend.AI's daemon processes which exhibit the role and key configurations (e.g.,
+  namespace) at a glance.
+
+- Improve support for using custom/private Docker registries.
+
+18.12.0a1 (2018-12-14)
+----------------------
+
+- NEW: App service ports!  You can start a compute session and directly connect to a
+  service running inside it, such as Jupyter Notebook! (#89)
+
+- Internal refactoring to clean up and fix bugs related to image name references.
+
+- Fix bugs in statistics collection.
+
+- Monitoring tools are separated as plugins.
+
+1.4.0 (2018-09-30)
+------------------
 
 - Generalizes accelerator supports
 

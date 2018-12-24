@@ -63,7 +63,7 @@ class AbstractAccelerator(metaclass=ABCMeta):
     @abstractmethod
     async def generate_docker_args(
             cls,
-            docker: 'aiodocker.docker.Docker',
+            docker: 'aiodocker.docker.Docker',  # noqa
             numa_node: int,
             limit_gpus: Container[ProcessorIdType] = None) \
             -> Mapping[str, Any]:

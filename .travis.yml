@@ -82,17 +82,24 @@ after_script:
 jobs:
   include:
     - stage: test
+
     - stage: deploy
+      python: "3.6"
       before_install: skip
       install: skip
+      before_script: skip
       script: skip
       after_script: skip
+      after_success: true
       deploy:
         on:
           tags: true
         provider: pypi
         distributions: sdist bdist_wheel
         skip_upload_docs: true
+        user: lablup
+        password:
+          secure: "TdL1VbJ/eLyFT3Aq9xz9M7m6c2At5BgLoKYEjjQB0mCo67aTrI8M2japAQ7wafVeBGGP4Mo8nnY+90tjmINg/x8bXvxCv7avEf9eq0HU6u+DIgeTYVPtZMNRbPWl8z7MPxOQBIwwszSV0dw9EHHTx14oSKtEnd9v9210+HJJtnNujo00QiNgU8NQVqAcBKCMyrqAeNlG4K0clZ1sD77W58gfCYfbIcYXNFV7n/J8ke/aSyBnow/n4JSj9kDUJgOojfg8jQ+d0/sUFxaYoaakvozz6zGvlRm57+NlBic1onMrHF7nuOLBFNDZguMTuemxDXqv7fZXp2QATA7u9WZtS2kW3alebQcbXq+SW9omG8uhbhHRkPiXMBUPvBz59fMPvy29zpN6b7f+ihA9QP47zi4pt6N6Z7Xovm3R+RctTSqZkWqc47eajVWZRevJ5Iw68woF0/p1w6pGm84eWonJDUlmofuwcmeYduj+J+y5bEPt9gHdUKM14uzhWQzsiV4NkapTWoX2IGILp/svJUTUrB2D7BrUrPKZ3NLKFjlVdXmhJZdcZ6ovsxh8C+Ls3i+fDAd3TKxy0TugwKXYScs26vRWcLx8mRlDCoY/BFyb7LtzDv/4/vyHvmJBY9XTxoz7PJRV1C2zUK1XOXjbh4iy4SYNIDB70izlswetRUgKlNQ="
 
 notifications:
   webhooks:
